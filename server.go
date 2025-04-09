@@ -318,7 +318,9 @@ type Server struct {
 	AssociatedUDP     *cache.Cache
 	UDPSrc            *cache.Cache
 	RunnerGroup       *runnergroup.RunnerGroup
-	// RFC: [UDP ASSOCIATE] The server MAY use this information to limit access to the association. Default false, no limit.
+	// RFC: [UDP ASSOCIATE] The server MAY use this information to limit access to the association.
+	// Default is true for security reasons (prevents open UDP relay attacks).
+	// When true, only clients with established TCP connection can use UDP.
 	LimitUDP bool
 	// Пулы буферов различных размеров для снижения нагрузки на GC
 	SmallBufferPool  *BufferPool // 2KB буферы для TCP соединений
@@ -396,6 +398,7 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 		LargeBufferPool:   largePool,
 		UDPConnPool:       udpConnPool,
 		TCPWorkerPool:     tcpWorkerPool,
+		LimitUDP:          true, // По умолчанию включаем ограничение для безопасности
 	}
 	return s, nil
 }
@@ -730,26 +733,19 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 		connCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		// Настраиваем таймаут, если необходимо
-		if s.TCPTimeout != 0 {
-			go func() {
-				ticker := time.NewTicker(time.Duration(s.TCPTimeout/2) * time.Second)
-				defer ticker.Stop()
-				for {
-					select {
-					case <-ticker.C:
-						c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
-						rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
-					case <-connCtx.Done():
-						return
-					}
-				}
-			}()
-		}
+		// Вместо использования тикера для постоянного обновления таймаутов,
+		// мы будем устанавливать таймауты только при реальной активности в io.Copy
+		// Это позволит разрывать неактивные соединения
+		hasTimeout := s.TCPTimeout != 0
 
-		// Используем пользовательский буфер из пула для io.CopyBuffer
-		buf := s.MediumBufferPool.Get()
-		defer s.MediumBufferPool.Put(buf)
+		// Используем ДВА отдельных буфера для предотвращения гонок данных
+		// когда оба направления копирования работают одновременно
+		clientToRemoteBuf := s.MediumBufferPool.Get()
+		remoteToClientBuf := s.MediumBufferPool.Get()
+		defer func() {
+			s.MediumBufferPool.Put(clientToRemoteBuf)
+			s.MediumBufferPool.Put(remoteToClientBuf)
+		}()
 
 		// Канал для сигнализации о завершении одной из горутин
 		doneCh := make(chan struct{}, 2)
@@ -761,13 +757,45 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 				cancel() // Отменяем контекст при завершении горутины
 			}()
 
-			// Копируем данные от удаленного соединения к клиенту
-			_, err := io.CopyBuffer(clientWriter, remoteReader, buf)
-			if err != nil {
-				slog.Debug("Error copying from remote to client", slog.Any("error", err))
+			// Создаем свою функцию копирования с обработкой таймаутов
+			buf := make([]byte, 32*1024)
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				default:
+					if hasTimeout {
+						// Устанавливаем таймаут чтения - соединение закроется, если не будет активности
+						rc.SetReadDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
+					}
+
+					nr, err := remoteReader.Read(buf)
+					if err != nil {
+						if err != io.EOF {
+							slog.Debug("Error reading from remote", slog.Any("error", err))
+						}
+						return
+					}
+
+					if hasTimeout {
+						// Обновляем таймаут записи после успешного чтения
+						c.SetWriteDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
+					}
+
+					_, err = clientWriter.Write(buf[:nr])
+					if err != nil {
+						slog.Debug("Error writing to client", slog.Any("error", err))
+						return
+					}
+
+					// Сбрасываем буфер, чтобы отправить все данные
+					err = clientWriter.Flush()
+					if err != nil {
+						slog.Debug("Error flushing to client", slog.Any("error", err))
+						return
+					}
+				}
 			}
-			// Сбрасываем буфер, чтобы отправить все данные
-			clientWriter.Flush()
 		}()
 
 		go func() {
@@ -776,13 +804,45 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 				cancel() // Отменяем контекст при завершении горутины
 			}()
 
-			// Копируем данные от клиента к удаленному соединению
-			_, err := io.CopyBuffer(remoteWriter, clientReader, buf)
-			if err != nil {
-				slog.Debug("Error copying from client to remote", slog.Any("error", err))
+			// Создаем свою функцию копирования с обработкой таймаутов
+			buf := make([]byte, 32*1024)
+			for {
+				select {
+				case <-connCtx.Done():
+					return
+				default:
+					if hasTimeout {
+						// Устанавливаем таймаут чтения - соединение закроется, если не будет активности
+						c.SetReadDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
+					}
+
+					nr, err := clientReader.Read(buf)
+					if err != nil {
+						if err != io.EOF {
+							slog.Debug("Error reading from client", slog.Any("error", err))
+						}
+						return
+					}
+
+					if hasTimeout {
+						// Обновляем таймаут записи после успешного чтения
+						rc.SetWriteDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
+					}
+
+					_, err = remoteWriter.Write(buf[:nr])
+					if err != nil {
+						slog.Debug("Error writing to remote", slog.Any("error", err))
+						return
+					}
+
+					// Сбрасываем буфер, чтобы отправить все данные
+					err = remoteWriter.Flush()
+					if err != nil {
+						slog.Debug("Error flushing to remote", slog.Any("error", err))
+						return
+					}
+				}
 			}
-			// Сбрасываем буфер, чтобы отправить все данные
-			remoteWriter.Flush()
 		}()
 
 		// Ожидаем завершения любой из горутин или отмены контекста
