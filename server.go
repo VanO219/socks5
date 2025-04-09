@@ -3,7 +3,6 @@ package socks5
 import (
 	"fmt"
 	"io"
-	"io/ioutil"
 	"log/slog"
 	"net"
 	"strings"
@@ -220,7 +219,6 @@ func (s *Server) ListenAndServe(h Handler) (err error) {
 					}
 				}(c)
 			}
-			return nil
 		},
 		Stop: func() error {
 			return l.Close()
@@ -263,7 +261,6 @@ func (s *Server) ListenAndServe(h Handler) (err error) {
 					}
 				}(addr, b[0:n])
 			}
-			return nil
 		},
 		Stop: func() error {
 			return s.UDPConn.Close()
@@ -335,7 +332,6 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err er
 				return nil
 			}
 		}
-		return nil
 	}
 
 	if r.Cmd == CmdUDP {
@@ -349,7 +345,7 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err er
 		s.AssociatedUDP.Set(caddr.String(), ch, -1)
 		defer s.AssociatedUDP.Delete(caddr.String())
 
-		io.Copy(ioutil.Discard, c)
+		io.Copy(io.Discard, c)
 		slog.Debug("TCP connection associated with UDP closed", slog.String("client_addr", caddr.String()))
 
 		return nil
