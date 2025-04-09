@@ -1,12 +1,15 @@
 package socks5
 
 import (
+	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"log/slog"
 	"net"
+	"runtime"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/VanO219/errors"
@@ -20,6 +23,280 @@ var (
 	// ErrUserPassAuth is the error when got invalid username or password
 	ErrUserPassAuth = errors.New("Invalid Username or Password for Auth")
 )
+
+// BufferPool представляет пул буферов для снижения нагрузки на GC
+type BufferPool struct {
+	pool sync.Pool
+}
+
+// NewBufferPool создает новый пул буферов указанного размера
+func NewBufferPool(size int) *BufferPool {
+	return &BufferPool{
+		pool: sync.Pool{
+			New: func() any {
+				return make([]byte, size)
+			},
+		},
+	}
+}
+
+// Get возвращает буфер из пула
+func (p *BufferPool) Get() []byte {
+	return p.pool.Get().([]byte)
+}
+
+// Put возвращает буфер в пул
+func (p *BufferPool) Put(b []byte) {
+	p.pool.Put(b)
+}
+
+// Clear очищает пул буферов
+// Примечание: sync.Pool автоматически очищается GC,
+// но мы можем форсировать это, заменяя сам пул
+func (p *BufferPool) Clear() {
+	// Создаем новый пул с тем же размером буфера
+	size := len(p.Get())
+	p.Put(make([]byte, size)) // Возвращаем буфер обратно
+
+	// Заменяем текущий пул новым
+	p.pool = sync.Pool{
+		New: func() any {
+			return make([]byte, size)
+		},
+	}
+
+	slog.Debug("Buffer pool cleared", slog.Int("buffer_size", size))
+}
+
+// UDPConnectionPool представляет пул UDP соединений для снижения нагрузки на сеть
+type UDPConnectionPool struct {
+	sync.Mutex
+	pool        map[string][]*net.UDPConn // ключ - назначение, значение - доступные соединения
+	maxIdle     int                       // максимальное количество простаивающих соединений в пуле
+	maxLifetime time.Duration             // максимальное время жизни соединения
+}
+
+// NewUDPConnectionPool создает новый пул UDP соединений
+func NewUDPConnectionPool(maxIdle int, maxLifetime time.Duration) *UDPConnectionPool {
+	p := &UDPConnectionPool{
+		pool:        make(map[string][]*net.UDPConn),
+		maxIdle:     maxIdle,
+		maxLifetime: maxLifetime,
+	}
+
+	// Запускаем горутину для очистки пула по таймеру
+	go p.cleanupRoutine()
+
+	return p
+}
+
+// cleanupRoutine периодически очищает старые соединения из пула
+func (p *UDPConnectionPool) cleanupRoutine() {
+	ticker := time.NewTicker(time.Minute)
+	defer ticker.Stop()
+
+	for range ticker.C {
+		p.cleanup()
+	}
+}
+
+// cleanup очищает старые соединения из пула
+func (p *UDPConnectionPool) cleanup() {
+	p.Lock()
+	defer p.Unlock()
+
+	// Удаляем лишние соединения из каждого пула
+	for dst, conns := range p.pool {
+		if len(conns) > p.maxIdle {
+			slog.Debug("Cleaning up excess UDP connections",
+				slog.String("destination", dst),
+				slog.Int("current_count", len(conns)),
+				slog.Int("max_idle", p.maxIdle))
+
+			// Закрываем лишние соединения
+			for i := p.maxIdle; i < len(conns); i++ {
+				conns[i].Close()
+			}
+			// Обновляем пул
+			p.pool[dst] = conns[:p.maxIdle]
+		}
+	}
+}
+
+// Get получает соединение из пула или создает новое
+func (p *UDPConnectionPool) Get(srcAddr, dstAddr string) (*net.UDPConn, error) {
+	key := srcAddr + ":" + dstAddr
+
+	p.Lock()
+	defer p.Unlock()
+
+	// Проверяем, есть ли доступные соединения
+	conns, ok := p.pool[key]
+	if ok && len(conns) > 0 {
+		// Берем последнее соединение из пула
+		conn := conns[len(conns)-1]
+		// Обновляем пул
+		p.pool[key] = conns[:len(conns)-1]
+		return conn, nil
+	}
+
+	// Нет доступных соединений, создаем новое
+	netConn, err := DialUDP("udp", srcAddr, dstAddr)
+	if err != nil {
+		return nil, err
+	}
+
+	// Приводим net.Conn к *net.UDPConn
+	conn, ok := netConn.(*net.UDPConn)
+	if !ok {
+		netConn.Close()
+		return nil, errors.New("failed to convert net.Conn to *net.UDPConn")
+	}
+
+	return conn, nil
+}
+
+// Put возвращает соединение в пул
+func (p *UDPConnectionPool) Put(srcAddr, dstAddr string, conn *net.UDPConn) {
+	if conn == nil {
+		return
+	}
+
+	key := srcAddr + ":" + dstAddr
+
+	p.Lock()
+	defer p.Unlock()
+
+	// Проверяем, не превышен ли предел
+	conns, ok := p.pool[key]
+	if !ok {
+		conns = make([]*net.UDPConn, 0)
+	}
+
+	if len(conns) >= p.maxIdle {
+		// Пул переполнен, закрываем соединение
+		conn.Close()
+		return
+	}
+
+	// Добавляем соединение в пул
+	p.pool[key] = append(conns, conn)
+}
+
+// Добавляем новый метод для освобождения всех ресурсов пула
+// Close закрывает все соединения в пуле и очищает его
+func (p *UDPConnectionPool) Close() {
+	p.Lock()
+	defer p.Unlock()
+
+	slog.Info("Closing all UDP connections in pool")
+
+	// Закрываем все соединения во всех пулах
+	for dst, conns := range p.pool {
+		for _, conn := range conns {
+			if err := conn.Close(); err != nil {
+				slog.Error("Error closing UDP connection",
+					slog.String("destination", dst),
+					slog.Any("error", err))
+			}
+		}
+	}
+
+	// Очищаем пул
+	p.pool = make(map[string][]*net.UDPConn)
+}
+
+// TCPWorkerPool представляет пул воркеров для обработки TCP соединений
+type TCPWorkerPool struct {
+	workQueue   chan tcpWork
+	workerCount int
+	wg          sync.WaitGroup
+	ctx         context.Context
+	cancel      context.CancelFunc
+}
+
+// tcpWork представляет задачу для обработки TCP соединения
+type tcpWork struct {
+	ctx    context.Context
+	server *Server
+	conn   *net.TCPConn
+	req    *Request
+}
+
+// NewTCPWorkerPool создает новый пул воркеров для обработки TCP соединений
+func NewTCPWorkerPool(ctx context.Context, workerCount int, queueSize int) *TCPWorkerPool {
+	workerCtx, cancel := context.WithCancel(ctx)
+
+	pool := &TCPWorkerPool{
+		workQueue:   make(chan tcpWork, queueSize),
+		workerCount: workerCount,
+		ctx:         workerCtx,
+		cancel:      cancel,
+	}
+
+	return pool
+}
+
+// Start запускает пул воркеров
+func (p *TCPWorkerPool) Start(handler Handler) {
+	for i := 0; i < p.workerCount; i++ {
+		p.wg.Add(1)
+		go p.worker(i, handler)
+	}
+}
+
+// worker представляет горутину для обработки TCP соединений
+func (p *TCPWorkerPool) worker(id int, handler Handler) {
+	defer p.wg.Done()
+
+	slog.Debug("Starting TCP worker", slog.Int("worker_id", id))
+
+	for {
+		select {
+		case <-p.ctx.Done():
+			slog.Debug("TCP worker exiting due to context cancellation", slog.Int("worker_id", id))
+			return
+
+		case work, ok := <-p.workQueue:
+			if !ok {
+				slog.Debug("TCP worker exiting, queue closed", slog.Int("worker_id", id))
+				return
+			}
+
+			// Обрабатываем TCP соединение
+			err := handler.TCPHandle(work.ctx, work.server, work.conn, work.req)
+			if err != nil {
+				slog.Error("Failed to handle TCP connection",
+					slog.Int("worker_id", id),
+					slog.Any("error", err))
+			}
+		}
+	}
+}
+
+// Submit добавляет задачу в очередь обработки
+func (p *TCPWorkerPool) Submit(ctx context.Context, server *Server, conn *net.TCPConn, req *Request) error {
+	select {
+	case <-p.ctx.Done():
+		return errors.New("worker pool is shutting down")
+
+	case p.workQueue <- tcpWork{ctx, server, conn, req}:
+		return nil
+
+	default:
+		// Очередь переполнена, обрабатываем соединение синхронно
+		slog.Warn("TCP worker queue is full, handling connection synchronously")
+		return server.Handle.TCPHandle(ctx, server, conn, req)
+	}
+}
+
+// Shutdown останавливает пул воркеров
+func (p *TCPWorkerPool) Shutdown() {
+	p.cancel()
+	close(p.workQueue)
+	p.wg.Wait()
+	slog.Info("TCP worker pool has been shut down")
+}
 
 // Server is socks5 server wrapper
 type Server struct {
@@ -39,6 +316,14 @@ type Server struct {
 	RunnerGroup       *runnergroup.RunnerGroup
 	// RFC: [UDP ASSOCIATE] The server MAY use this information to limit access to the association. Default false, no limit.
 	LimitUDP bool
+	// Пулы буферов различных размеров для снижения нагрузки на GC
+	SmallBufferPool  *BufferPool // 2KB буферы для TCP соединений
+	MediumBufferPool *BufferPool // 8KB буферы для средних пакетов
+	LargeBufferPool  *BufferPool // 64KB буферы для UDP датаграмм
+	// Пул UDP соединений
+	UDPConnPool *UDPConnectionPool
+	// Пул воркеров для обработки TCP соединений
+	TCPWorkerPool *TCPWorkerPool
 }
 
 // UDPExchange used to store client address and remote connection
@@ -68,9 +353,26 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 		m = MethodUsernamePassword
 	}
 
-	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
-	cs1 := cache.New(cache.NoExpiration, cache.NoExpiration)
-	cs2 := cache.New(cache.NoExpiration, cache.NoExpiration)
+	// Устанавливаем разумные значения TTL для кешей вместо NoExpiration
+	// 30 минут для элементов, очистка каждый час
+	cs := cache.New(30*time.Minute, 1*time.Hour)
+	cs1 := cache.New(30*time.Minute, 1*time.Hour)
+	cs2 := cache.New(30*time.Minute, 1*time.Hour)
+
+	// Создаем пулы буферов различных размеров
+	smallPool := NewBufferPool(2 * 1024)  // 2KB для TCP
+	mediumPool := NewBufferPool(8 * 1024) // 8KB для средних пакетов
+	largePool := NewBufferPool(64 * 1024) // 64KB для UDP датаграмм
+
+	// Создаем пул UDP соединений с лимитом 50 соединений на каждое направление
+	// и максимальным временем жизни соединения 5 минут
+	udpConnPool := NewUDPConnectionPool(50, 5*time.Minute)
+
+	// Создаем пул воркеров для обработки TCP соединений
+	// Количество воркеров равно количеству процессоров (максимум 32)
+	numWorkers := min(runtime.NumCPU(), 32)
+	// Размер очереди - 1000 соединений
+	tcpWorkerPool := NewTCPWorkerPool(context.Background(), numWorkers, 1000)
 
 	s = &Server{
 		Method:            m,
@@ -85,6 +387,11 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 		AssociatedUDP:     cs1,
 		UDPSrc:            cs2,
 		RunnerGroup:       runnergroup.New(),
+		SmallBufferPool:   smallPool,
+		MediumBufferPool:  mediumPool,
+		LargeBufferPool:   largePool,
+		UDPConnPool:       udpConnPool,
+		TCPWorkerPool:     tcpWorkerPool,
 	}
 	return s, nil
 }
@@ -208,6 +515,10 @@ func (s *Server) ListenAndServeWithContext(ctx context.Context, h Handler) (err 
 		s.Shutdown()
 	}()
 
+	// Запускаем пул воркеров для обработки TCP соединений
+	s.TCPWorkerPool.Start(s.Handle)
+	defer s.TCPWorkerPool.Shutdown()
+
 	addr, err := net.ResolveTCPAddr("tcp", s.Addr)
 	if err != nil {
 		return errors.Wrap(err, "failed to resolve TCP address")
@@ -236,24 +547,33 @@ func (s *Server) ListenAndServeWithContext(ctx context.Context, h Handler) (err 
 						}
 						return err
 					}
+
 					// Для каждого соединения создаем свой контекст
 					connCtx, connCancel := context.WithCancel(serverCtx)
+
+					// Обрабатываем соединение асинхронно
 					go func(ctx context.Context, cancel context.CancelFunc, c *net.TCPConn) {
 						defer func() {
 							c.Close()
 							cancel()
 						}()
+
+						// Выполняем первоначальное согласование протокола
 						if err := s.Negotiate(c); err != nil {
 							slog.Error("Failed to negotiate", slog.Any("error", err))
 							return
 						}
+
+						// Получаем запрос
 						r, err := s.GetRequest(c)
 						if err != nil {
 							slog.Error("Failed to get request", slog.Any("error", err))
 							return
 						}
-						if err := s.Handle.TCPHandle(ctx, s, c, r); err != nil {
-							slog.Error("Failed to handle TCP", slog.Any("error", err))
+
+						// Отправляем запрос в пул воркеров для обработки
+						if err := s.TCPWorkerPool.Submit(ctx, s, c, r); err != nil {
+							slog.Error("Failed to submit TCP connection to worker pool", slog.Any("error", err))
 						}
 					}(connCtx, connCancel, c)
 				}
@@ -287,17 +607,33 @@ func (s *Server) ListenAndServeWithContext(ctx context.Context, h Handler) (err 
 				default:
 					// Устанавливаем таймаут для чтения UDP, чтобы периодически проверять контекст
 					s.UDPConn.SetReadDeadline(time.Now().Add(time.Second * 3))
-					b := make([]byte, 65507)
-					n, addr, err := s.UDPConn.ReadFromUDP(b)
+
+					// Используем буфер из пула вместо создания нового буфера на каждую операцию чтения
+					buffer := s.LargeBufferPool.Get()
+					n, addr, err := s.UDPConn.ReadFromUDP(buffer)
+
 					if err != nil {
+						// Возвращаем буфер в пул при ошибке
+						s.LargeBufferPool.Put(buffer)
+
 						// Ошибка таймаута, проверяем контекст и продолжаем
 						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 							continue
 						}
 						return err
 					}
+
 					// Создаем контекст для обработки датаграммы
 					dgCtx, dgCancel := context.WithCancel(serverCtx)
+
+					// Копируем полученные данные в новый буфер нужного размера для обработки в горутине
+					// Это необходимо, так как буфер будет переиспользован для следующего чтения
+					dataCopy := make([]byte, n)
+					copy(dataCopy, buffer[:n])
+
+					// Возвращаем буфер в пул
+					s.LargeBufferPool.Put(buffer)
+
 					go func(ctx context.Context, cancel context.CancelFunc, addr *net.UDPAddr, b []byte) {
 						defer cancel()
 						d, err := NewDatagramFromBytes(b)
@@ -313,7 +649,7 @@ func (s *Server) ListenAndServeWithContext(ctx context.Context, h Handler) (err 
 							slog.Error("Failed to handle UDP", slog.Any("error", err))
 							return
 						}
-					}(dgCtx, dgCancel, addr, b[0:n])
+					}(dgCtx, dgCancel, addr, dataCopy)
 				}
 			}
 		},
@@ -328,6 +664,36 @@ func (s *Server) ListenAndServeWithContext(ctx context.Context, h Handler) (err 
 
 // Stop server
 func (s *Server) Shutdown() error {
+	slog.Info("Shutting down SOCKS5 server")
+
+	// Закрываем пул UDP соединений
+	if s.UDPConnPool != nil {
+		s.UDPConnPool.Close()
+	}
+
+	// Очищаем пулы буферов
+	if s.SmallBufferPool != nil {
+		s.SmallBufferPool.Clear()
+	}
+	if s.MediumBufferPool != nil {
+		s.MediumBufferPool.Clear()
+	}
+	if s.LargeBufferPool != nil {
+		s.LargeBufferPool.Clear()
+	}
+
+	// Очищаем кеши
+	if s.UDPExchanges != nil {
+		s.UDPExchanges.Flush()
+	}
+	if s.AssociatedUDP != nil {
+		s.AssociatedUDP.Flush()
+	}
+	if s.UDPSrc != nil {
+		s.UDPSrc.Flush()
+	}
+
+	// Останавливаем все горутины
 	return s.RunnerGroup.Done()
 }
 
@@ -355,6 +721,13 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 		}
 		defer rc.Close()
 
+		// Создаем буферизованные reader/writer для соединений
+		// Увеличиваем размер буфера для лучшей производительности
+		clientReader := bufio.NewReaderSize(c, 32*1024)
+		clientWriter := bufio.NewWriterSize(c, 32*1024)
+		remoteReader := bufio.NewReaderSize(rc, 32*1024)
+		remoteWriter := bufio.NewWriterSize(rc, 32*1024)
+
 		// Создаем контекст с возможностью отмены
 		connCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -369,7 +742,10 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 				cancel() // Отменяем контекст при завершении горутины
 			}()
 
-			var bf [1024 * 2]byte
+			// Берем буфер из пула вместо локальной аллокации
+			buf := s.MediumBufferPool.Get() // Используем буфер большего размера
+			defer s.MediumBufferPool.Put(buf)
+
 			for {
 				select {
 				case <-connCtx.Done():
@@ -381,11 +757,20 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 							return
 						}
 					}
-					i, err := rc.Read(bf[:])
+
+					// Чтение из буферизованного reader
+					i, err := remoteReader.Read(buf)
 					if err != nil {
 						return
 					}
-					if _, err := c.Write(bf[0:i]); err != nil {
+
+					// Запись в буферизованный writer
+					if _, err := clientWriter.Write(buf[0:i]); err != nil {
+						return
+					}
+
+					// Немедленная отправка данных
+					if err := clientWriter.Flush(); err != nil {
 						return
 					}
 				}
@@ -393,7 +778,9 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 		}()
 
 		// Чтение из клиентского соединения и запись в удаленное
-		var bf [1024 * 2]byte
+		buf := s.MediumBufferPool.Get() // Используем буфер большего размера
+		defer s.MediumBufferPool.Put(buf)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -408,11 +795,20 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 						return errors.Wrap(err, "failed to set client deadline")
 					}
 				}
-				i, err := c.Read(bf[:])
+
+				// Чтение из буферизованного reader
+				i, err := clientReader.Read(buf)
 				if err != nil {
 					return nil
 				}
-				if _, err := rc.Write(bf[0:i]); err != nil {
+
+				// Запись в буферизованный writer
+				if _, err := remoteWriter.Write(buf[0:i]); err != nil {
+					return nil
+				}
+
+				// Немедленная отправка данных
+				if err := remoteWriter.Flush(); err != nil {
 					return nil
 				}
 			}
@@ -504,20 +900,27 @@ func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPA
 		laddr = any.(string)
 	}
 
-	rc, err := DialUDP("udp", laddr, dst)
+	// Вместо прямого вызова DialUDP используем пул соединений
+	rc, err := s.UDPConnPool.Get(laddr, dst)
 	if err != nil {
+		// Если не получилось получить соединение из пула или создать новое с указанным laddr,
+		// пробуем создать соединение без указания локального адреса
 		if !strings.Contains(err.Error(), "address already in use") && !strings.Contains(err.Error(), "can't assign requested address") {
-			return errors.Wrap(err, "failed to dial UDP")
+			return errors.Wrap(err, "failed to get UDP connection from pool")
 		}
-		rc, err = DialUDP("udp", "", dst)
+
+		// Пробуем получить соединение из пула без указания локального адреса
+		rc, err = s.UDPConnPool.Get("", dst)
 		if err != nil {
-			return errors.Wrap(err, "failed to dial UDP without local address")
+			return errors.Wrap(err, "failed to get UDP connection from pool without local address")
 		}
+
 		laddr = ""
 	}
 
+	// Сохраняем локальный адрес для будущих соединений с временем жизни 30 минут
 	if laddr == "" {
-		s.UDPSrc.Set(src+dst, rc.LocalAddr().String(), -1)
+		s.UDPSrc.Set(src+dst, rc.LocalAddr().String(), 30*time.Minute)
 	}
 
 	ue = &UDPExchange{
@@ -531,19 +934,32 @@ func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPA
 		slog.String("remote", d.Address()))
 
 	if err := send(ue, d.Data); err != nil {
-		ue.RemoteConn.Close()
+		// Возвращаем соединение в пул в случае ошибки
+		s.UDPConnPool.Put(laddr, dst, rc)
 		return errors.Wrap(err, "failed to send initial data")
 	}
 
-	s.UDPExchanges.Set(src+dst, ue, -1)
+	// Устанавливаем время жизни элемента в кеше - 30 минут
+	s.UDPExchanges.Set(src+dst, ue, 30*time.Minute)
 
-	go func(ue *UDPExchange, dst string) {
+	go func(ue *UDPExchange, dst string, localAddr string) {
 		defer func() {
-			ue.RemoteConn.Close()
+			// Возвращаем соединение в пул при завершении горутины
+			if udpConn, ok := ue.RemoteConn.(*net.UDPConn); ok {
+				s.UDPConnPool.Put(localAddr, dst, udpConn)
+			} else {
+				ue.RemoteConn.Close() // Если не UDPConn, просто закрываем
+			}
+
 			s.UDPExchanges.Delete(ue.ClientAddr.String() + dst)
+			// Удаляем запись из UDPSrc при завершении обмена данными
+			s.UDPSrc.Delete(ue.ClientAddr.String() + dst)
 		}()
 
-		var b [65507]byte
+		// Используем буфер из пула для UDP данных
+		buf := s.LargeBufferPool.Get()
+		defer s.LargeBufferPool.Put(buf)
+
 		for {
 			select {
 			case <-ctx.Done():
@@ -560,8 +976,15 @@ func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPA
 					}
 				}
 
-				n, err := ue.RemoteConn.Read(b[:])
+				// Чтение в буфер из пула
+				n, err := ue.RemoteConn.Read(buf)
 				if err != nil {
+					if !errors.Is(err, io.EOF) && !strings.Contains(err.Error(), "use of closed network connection") {
+						slog.Error("Error reading from UDP connection",
+							slog.String("client", ue.ClientAddr.String()),
+							slog.String("remote", ue.RemoteConn.RemoteAddr().String()),
+							slog.Any("error", err))
+					}
 					return
 				}
 
@@ -581,8 +1004,15 @@ func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPA
 					addr = addr[1:]
 				}
 
-				d1 := NewDatagram(a, addr, port, b[0:n])
-				if _, err := s.UDPConn.WriteToUDP(d1.Bytes(), ue.ClientAddr); err != nil {
+				// Создаем датаграмму для отправки клиенту
+				d1 := NewDatagram(a, addr, port, buf[0:n])
+				datagramBytes := d1.Bytes()
+
+				// Добавляем обработку ошибок при отправке датаграммы
+				if _, err := s.UDPConn.WriteToUDP(datagramBytes, ue.ClientAddr); err != nil {
+					slog.Error("Failed to send datagram to client",
+						slog.String("client", ue.ClientAddr.String()),
+						slog.String("error", err.Error()))
 					return
 				}
 
@@ -599,7 +1029,7 @@ func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPA
 					slog.String("address", d1.Address()))
 			}
 		}
-	}(ue, dst)
+	}(ue, dst, laddr)
 
 	return nil
 }

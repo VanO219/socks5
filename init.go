@@ -4,10 +4,6 @@ import (
 	"net"
 )
 
-func init() {
-	// Пользователь библиотеки должен сам настроить логирование через slog.SetDefault()
-}
-
 var Resolve func(network string, addr string) (net.Addr, error) = func(network string, addr string) (net.Addr, error) {
 	if network == "tcp" {
 		return net.ResolveTCPAddr("tcp", addr)

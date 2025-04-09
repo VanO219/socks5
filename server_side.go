@@ -333,12 +333,40 @@ func NewDatagram(atyp byte, dstaddr []byte, dstport []byte, data []byte) *Datagr
 
 // Bytes return []byte
 func (d *Datagram) Bytes() []byte {
-	b := make([]byte, 0)
-	b = append(b, d.Rsv...)
-	b = append(b, d.Frag)
-	b = append(b, d.Atyp)
-	b = append(b, d.DstAddr...)
-	b = append(b, d.DstPort...)
-	b = append(b, d.Data...)
+	// Предварительно вычисляем необходимый размер буфера
+	totalSize := 0
+	totalSize += len(d.Rsv)     // Размер Rsv (обычно 2 байта)
+	totalSize += 1              // Размер Frag (1 байт)
+	totalSize += 1              // Размер Atyp (1 байт)
+	totalSize += len(d.DstAddr) // Размер адреса назначения
+	totalSize += len(d.DstPort) // Размер порта назначения (обычно 2 байта)
+	totalSize += len(d.Data)    // Размер данных
+
+	// Создаем буфер нужного размера
+	b := make([]byte, totalSize)
+
+	// Заполняем буфер, отслеживая текущую позицию
+	offset := 0
+
+	// Копируем резервные байты
+	offset += copy(b[offset:], d.Rsv)
+
+	// Копируем байт фрагментации
+	b[offset] = d.Frag
+	offset++
+
+	// Копируем тип адреса
+	b[offset] = d.Atyp
+	offset++
+
+	// Копируем адрес назначения
+	offset += copy(b[offset:], d.DstAddr)
+
+	// Копируем порт назначения
+	offset += copy(b[offset:], d.DstPort)
+
+	// Копируем данные
+	copy(b[offset:], d.Data)
+
 	return b
 }

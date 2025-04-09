@@ -137,18 +137,33 @@ func (c *Client) Read(b []byte) (n int, err error) {
 		return c.TCPConn.Read(b)
 	}
 
+	// Читаем данные в исходный буфер напрямую
 	n, err = c.UDPConn.Read(b)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to read from UDP connection")
 	}
 
+	// Парсим датаграмму SOCKS5 из полученных данных
 	d, err := NewDatagramFromBytes(b[0:n])
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to parse datagram")
 	}
 
-	n = copy(b, d.Data)
-	return n, nil
+	// Определяем размер полезных данных
+	dataLen := len(d.Data)
+
+	// Если исходные данные и конечные данные занимают одно и то же пространство памяти,
+	// нам нужно сделать копию, чтобы избежать перекрытия при копировании
+	if dataLen > 0 && &b[0] != &d.Data[0] {
+		// Копируем данные в исходный буфер
+		copy(b, d.Data)
+	} else if dataLen == 0 {
+		// Нет данных для копирования
+		return 0, nil
+	}
+	// В противном случае данные уже находятся в правильном месте буфера
+
+	return dataLen, nil
 }
 
 func (c *Client) Write(b []byte) (n int, err error) {
@@ -169,17 +184,24 @@ func (c *Client) Write(b []byte) (n int, err error) {
 		h = h[1:]
 	}
 
+	// Создаем датаграмму SOCKS5 с пользовательскими данными
 	d := NewDatagram(a, h, p, b)
-	b1 := d.Bytes()
-	n, err = c.UDPConn.Write(b1)
+
+	// Получаем байтовое представление датаграммы более эффективным способом
+	datagramBytes := d.Bytes()
+
+	// Записываем датаграмму целиком
+	n, err = c.UDPConn.Write(datagramBytes)
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write to UDP connection")
 	}
 
-	if len(b1) != n {
+	// Проверяем, что вся датаграмма была успешно отправлена
+	if len(datagramBytes) != n {
 		return 0, errors.New("not all data was written")
 	}
 
+	// Возвращаем количество пользовательских данных, которые были отправлены
 	return len(b), nil
 }
 
