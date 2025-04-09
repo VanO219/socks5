@@ -1,15 +1,15 @@
 package socks5
 
 import (
-	"errors"
 	"fmt"
 	"io"
 	"io/ioutil"
-	"log"
+	"log/slog"
 	"net"
 	"strings"
 	"time"
 
+	"github.com/VanO219/errors"
 	cache "github.com/patrickmn/go-cache"
 	"github.com/txthinking/runnergroup"
 )
@@ -48,23 +48,31 @@ type UDPExchange struct {
 }
 
 // NewClassicServer return a server which allow none method
-func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeout int) (*Server, error) {
+func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeout int) (s *Server, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewClassicServer()")
+	}()
+
 	_, p, err := net.SplitHostPort(addr)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to split host:port")
 	}
+
 	saddr, err := Resolve("udp", net.JoinHostPort(ip, p))
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to resolve address")
 	}
+
 	m := MethodNone
 	if username != "" && password != "" {
 		m = MethodUsernamePassword
 	}
+
 	cs := cache.New(cache.NoExpiration, cache.NoExpiration)
 	cs1 := cache.New(cache.NoExpiration, cache.NoExpiration)
 	cs2 := cache.New(cache.NoExpiration, cache.NoExpiration)
-	s := &Server{
+
+	s = &Server{
 		Method:            m,
 		UserName:          username,
 		Password:          password,
@@ -84,11 +92,16 @@ func NewClassicServer(addr, ip, username, password string, tcpTimeout, udpTimeou
 // Negotiate handle negotiate packet.
 // This method do not handle gssapi(0x01) method now.
 // Error or OK both replied.
-func (s *Server) Negotiate(rw io.ReadWriter) error {
+func (s *Server) Negotiate(rw io.ReadWriter) (err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.Server.Negotiate()")
+	}()
+
 	rq, err := NewNegotiationRequestFrom(rw)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to read negotiation request")
 	}
+
 	var got bool
 	var m byte
 	for _, m = range rq.Methods {
@@ -99,29 +112,30 @@ func (s *Server) Negotiate(rw io.ReadWriter) error {
 	if !got {
 		rp := NewNegotiationReply(MethodUnsupportAll)
 		if _, err := rp.WriteTo(rw); err != nil {
-			return err
+			return errors.Wrap(err, "failed to write negotiation reply")
 		}
 	}
+
 	rp := NewNegotiationReply(s.Method)
 	if _, err := rp.WriteTo(rw); err != nil {
-		return err
+		return errors.Wrap(err, "failed to write negotiation reply")
 	}
 
 	if s.Method == MethodUsernamePassword {
 		urq, err := NewUserPassNegotiationRequestFrom(rw)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to read username/password request")
 		}
 		if string(urq.Uname) != s.UserName || string(urq.Passwd) != s.Password {
 			urp := NewUserPassNegotiationReply(UserPassStatusFailure)
 			if _, err := urp.WriteTo(rw); err != nil {
-				return err
+				return errors.Wrap(err, "failed to write username/password reply")
 			}
 			return ErrUserPassAuth
 		}
 		urp := NewUserPassNegotiationReply(UserPassStatusSuccess)
 		if _, err := urp.WriteTo(rw); err != nil {
-			return err
+			return errors.Wrap(err, "failed to write username/password reply")
 		}
 	}
 	return nil
@@ -129,11 +143,16 @@ func (s *Server) Negotiate(rw io.ReadWriter) error {
 
 // GetRequest get request packet from client, and check command according to SupportedCommands
 // Error replied.
-func (s *Server) GetRequest(rw io.ReadWriter) (*Request, error) {
-	r, err := NewRequestFrom(rw)
+func (s *Server) GetRequest(rw io.ReadWriter) (r *Request, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.Server.GetRequest()")
+	}()
+
+	r, err = NewRequestFrom(rw)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read request")
 	}
+
 	var supported bool
 	for _, c := range s.SupportedCommands {
 		if r.Cmd == c {
@@ -149,7 +168,7 @@ func (s *Server) GetRequest(rw io.ReadWriter) (*Request, error) {
 			p = NewReply(RepCommandNotSupported, ATYPIPv6, []byte(net.IPv6zero), []byte{0x00, 0x00})
 		}
 		if _, err := p.WriteTo(rw); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to write reply")
 		}
 		return nil, ErrUnsupportCmd
 	}
@@ -157,20 +176,27 @@ func (s *Server) GetRequest(rw io.ReadWriter) (*Request, error) {
 }
 
 // Run server
-func (s *Server) ListenAndServe(h Handler) error {
+func (s *Server) ListenAndServe(h Handler) (err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.Server.ListenAndServe()")
+	}()
+
 	if h == nil {
 		s.Handle = &DefaultHandle{}
 	} else {
 		s.Handle = h
 	}
+
 	addr, err := net.ResolveTCPAddr("tcp", s.Addr)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to resolve TCP address")
 	}
+
 	l, err := net.ListenTCP("tcp", addr)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "failed to listen on TCP address")
 	}
+
 	s.RunnerGroup.Add(&runnergroup.Runner{
 		Start: func() error {
 			for {
@@ -181,16 +207,16 @@ func (s *Server) ListenAndServe(h Handler) error {
 				go func(c *net.TCPConn) {
 					defer c.Close()
 					if err := s.Negotiate(c); err != nil {
-						log.Println(err)
+						slog.Error("Failed to negotiate", slog.Any("error", err))
 						return
 					}
 					r, err := s.GetRequest(c)
 					if err != nil {
-						log.Println(err)
+						slog.Error("Failed to get request", slog.Any("error", err))
 						return
 					}
 					if err := s.Handle.TCPHandle(s, c, r); err != nil {
-						log.Println(err)
+						slog.Error("Failed to handle TCP", slog.Any("error", err))
 					}
 				}(c)
 			}
@@ -200,16 +226,19 @@ func (s *Server) ListenAndServe(h Handler) error {
 			return l.Close()
 		},
 	})
+
 	addr1, err := net.ResolveUDPAddr("udp", s.Addr)
 	if err != nil {
 		l.Close()
-		return err
+		return errors.Wrap(err, "failed to resolve UDP address")
 	}
+
 	s.UDPConn, err = net.ListenUDP("udp", addr1)
 	if err != nil {
 		l.Close()
-		return err
+		return errors.Wrap(err, "failed to listen on UDP address")
 	}
+
 	s.RunnerGroup.Add(&runnergroup.Runner{
 		Start: func() error {
 			for {
@@ -221,15 +250,15 @@ func (s *Server) ListenAndServe(h Handler) error {
 				go func(addr *net.UDPAddr, b []byte) {
 					d, err := NewDatagramFromBytes(b)
 					if err != nil {
-						log.Println(err)
+						slog.Error("Failed to parse datagram", slog.Any("error", err))
 						return
 					}
 					if d.Frag != 0x00 {
-						log.Println("Ignore frag", d.Frag)
+						slog.Info("Ignoring fragmented datagram", slog.Any("frag", d.Frag))
 						return
 					}
 					if err := s.Handle.UDPHandle(s, addr, d); err != nil {
-						log.Println(err)
+						slog.Error("Failed to handle UDP", slog.Any("error", err))
 						return
 					}
 				}(addr, b[0:n])
@@ -240,6 +269,7 @@ func (s *Server) ListenAndServe(h Handler) error {
 			return s.UDPConn.Close()
 		},
 	})
+
 	return s.RunnerGroup.Wait()
 }
 
@@ -260,13 +290,18 @@ type DefaultHandle struct {
 }
 
 // TCPHandle auto handle request. You may prefer to do yourself.
-func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
+func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.DefaultHandle.TCPHandle()")
+	}()
+
 	if r.Cmd == CmdConnect {
 		rc, err := r.Connect(c)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to connect")
 		}
 		defer rc.Close()
+
 		go func() {
 			var bf [1024 * 2]byte
 			for {
@@ -284,6 +319,7 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 				}
 			}
 		}()
+
 		var bf [1024 * 2]byte
 		for {
 			if s.TCPTimeout != 0 {
@@ -301,26 +337,32 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) error {
 		}
 		return nil
 	}
+
 	if r.Cmd == CmdUDP {
 		caddr, err := r.UDP(c, s.ServerAddr)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to setup UDP")
 		}
+
 		ch := make(chan byte)
 		defer close(ch)
 		s.AssociatedUDP.Set(caddr.String(), ch, -1)
 		defer s.AssociatedUDP.Delete(caddr.String())
+
 		io.Copy(ioutil.Discard, c)
-		if Debug {
-			log.Printf("A tcp connection that udp %#v associated closed\n", caddr.String())
-		}
+		slog.Debug("TCP connection associated with UDP closed", slog.String("client_addr", caddr.String()))
+
 		return nil
 	}
 	return ErrUnsupportCmd
 }
 
 // UDPHandle auto handle packet. You may prefer to do yourself.
-func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) error {
+func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) (err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.DefaultHandle.UDPHandle()")
+	}()
+
 	src := addr.String()
 	var ch chan byte
 	if s.LimitUDP {
@@ -330,6 +372,7 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		}
 		ch = any.(chan byte)
 	}
+
 	send := func(ue *UDPExchange, data []byte) error {
 		select {
 		case <-ch:
@@ -337,11 +380,13 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		default:
 			_, err := ue.RemoteConn.Write(data)
 			if err != nil {
-				return err
+				return errors.Wrap(err, "failed to write to remote")
 			}
-			if Debug {
-				log.Printf("Sent UDP data to remote. client: %#v server: %#v remote: %#v data: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), ue.RemoteConn.RemoteAddr().String(), data)
-			}
+			slog.Debug("Sent UDP data to remote",
+				slog.String("client", ue.ClientAddr.String()),
+				slog.String("server_local", ue.RemoteConn.LocalAddr().String()),
+				slog.String("remote", ue.RemoteConn.RemoteAddr().String()),
+				slog.Int("data_len", len(data)))
 		}
 		return nil
 	}
@@ -354,84 +399,107 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) err
 		return send(ue, d.Data)
 	}
 
-	if Debug {
-		log.Printf("Call udp: %#v\n", dst)
-	}
+	slog.Debug("Creating new UDP connection", slog.String("dst", dst))
+
 	var laddr string
 	any, ok := s.UDPSrc.Get(src + dst)
 	if ok {
 		laddr = any.(string)
 	}
+
 	rc, err := DialUDP("udp", laddr, dst)
 	if err != nil {
 		if !strings.Contains(err.Error(), "address already in use") && !strings.Contains(err.Error(), "can't assign requested address") {
-			return err
+			return errors.Wrap(err, "failed to dial UDP")
 		}
 		rc, err = DialUDP("udp", "", dst)
 		if err != nil {
-			return err
+			return errors.Wrap(err, "failed to dial UDP without local address")
 		}
 		laddr = ""
 	}
+
 	if laddr == "" {
 		s.UDPSrc.Set(src+dst, rc.LocalAddr().String(), -1)
 	}
+
 	ue = &UDPExchange{
 		ClientAddr: addr,
 		RemoteConn: rc,
 	}
-	if Debug {
-		log.Printf("Created remote UDP conn for client. client: %#v server: %#v remote: %#v\n", addr.String(), ue.RemoteConn.LocalAddr().String(), d.Address())
-	}
+
+	slog.Debug("Created remote UDP connection",
+		slog.String("client", addr.String()),
+		slog.String("server_local", ue.RemoteConn.LocalAddr().String()),
+		slog.String("remote", d.Address()))
+
 	if err := send(ue, d.Data); err != nil {
 		ue.RemoteConn.Close()
-		return err
+		return errors.Wrap(err, "failed to send initial data")
 	}
+
 	s.UDPExchanges.Set(src+dst, ue, -1)
+
 	go func(ue *UDPExchange, dst string) {
 		defer func() {
 			ue.RemoteConn.Close()
 			s.UDPExchanges.Delete(ue.ClientAddr.String() + dst)
 		}()
+
 		var b [65507]byte
 		for {
 			select {
 			case <-ch:
-				if Debug {
-					log.Printf("The tcp that udp address %s associated closed\n", ue.ClientAddr.String())
-				}
+				slog.Debug("TCP connection closed", slog.String("client", ue.ClientAddr.String()))
 				return
 			default:
 				if s.UDPTimeout != 0 {
 					if err := ue.RemoteConn.SetDeadline(time.Now().Add(time.Duration(s.UDPTimeout) * time.Second)); err != nil {
-						log.Println(err)
+						slog.Error("Failed to set deadline", slog.Any("error", err))
 						return
 					}
 				}
+
 				n, err := ue.RemoteConn.Read(b[:])
 				if err != nil {
 					return
 				}
-				if Debug {
-					log.Printf("Got UDP data from remote. client: %#v server: %#v remote: %#v data: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), ue.RemoteConn.RemoteAddr().String(), b[0:n])
-				}
+
+				slog.Debug("Got UDP data from remote",
+					slog.String("client", ue.ClientAddr.String()),
+					slog.String("server_local", ue.RemoteConn.LocalAddr().String()),
+					slog.String("remote", ue.RemoteConn.RemoteAddr().String()),
+					slog.Int("data_len", n))
+
 				a, addr, port, err := ParseAddress(dst)
 				if err != nil {
-					log.Println(err)
+					slog.Error("Failed to parse address", slog.Any("error", err))
 					return
 				}
+
 				if a == ATYPDomain {
 					addr = addr[1:]
 				}
+
 				d1 := NewDatagram(a, addr, port, b[0:n])
 				if _, err := s.UDPConn.WriteToUDP(d1.Bytes(), ue.ClientAddr); err != nil {
 					return
 				}
-				if Debug {
-					log.Printf("Sent Datagram. client: %#v server: %#v remote: %#v data: %#v %#v %#v %#v %#v %#v datagram address: %#v\n", ue.ClientAddr.String(), ue.RemoteConn.LocalAddr().String(), ue.RemoteConn.RemoteAddr().String(), d1.Rsv, d1.Frag, d1.Atyp, d1.DstAddr, d1.DstPort, d1.Data, d1.Address())
-				}
+
+				slog.Debug("Sent datagram to client",
+					slog.String("client", ue.ClientAddr.String()),
+					slog.String("server_local", ue.RemoteConn.LocalAddr().String()),
+					slog.String("remote", ue.RemoteConn.RemoteAddr().String()),
+					slog.Any("rsv", d1.Rsv),
+					slog.Any("frag", d1.Frag),
+					slog.Any("atyp", d1.Atyp),
+					slog.Any("dst_addr", d1.DstAddr),
+					slog.Any("dst_port", d1.DstPort),
+					slog.Int("data_len", len(d1.Data)),
+					slog.String("address", d1.Address()))
 			}
 		}
 	}(ue, dst)
+
 	return nil
 }

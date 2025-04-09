@@ -1,9 +1,10 @@
 package socks5
 
 import (
-	"errors"
 	"io"
-	"log"
+	"log/slog"
+
+	"github.com/VanO219/errors"
 )
 
 var (
@@ -16,11 +17,15 @@ var (
 )
 
 // NewNegotiationRequestFrom read negotiation requst packet from client
-func NewNegotiationRequestFrom(r io.Reader) (*NegotiationRequest, error) {
+func NewNegotiationRequestFrom(r io.Reader) (nr *NegotiationRequest, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewNegotiationRequestFrom()")
+	}()
+
 	// memory strict
 	bb := make([]byte, 2)
 	if _, err := io.ReadFull(r, bb); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read version and methods count")
 	}
 	if bb[0] != Ver {
 		return nil, ErrVersion
@@ -30,11 +35,14 @@ func NewNegotiationRequestFrom(r io.Reader) (*NegotiationRequest, error) {
 	}
 	ms := make([]byte, int(bb[1]))
 	if _, err := io.ReadFull(r, ms); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read methods")
 	}
-	if Debug {
-		log.Printf("Got NegotiationRequest: %#v %#v %#v\n", bb[0], bb[1], ms)
-	}
+
+	slog.Debug("Got negotiation request",
+		slog.Any("version", bb[0]),
+		slog.Any("methods_count", bb[1]),
+		slog.Any("methods", ms))
+
 	return &NegotiationRequest{
 		Ver:      bb[0],
 		NMethods: bb[1],
@@ -51,22 +59,32 @@ func NewNegotiationReply(method byte) *NegotiationReply {
 }
 
 // WriteTo write negotiation reply packet into client
-func (r *NegotiationReply) WriteTo(w io.Writer) (int64, error) {
+func (r *NegotiationReply) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NegotiationReply.WriteTo()")
+	}()
+
 	i, err := w.Write([]byte{r.Ver, r.Method})
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "failed to write negotiation reply")
 	}
-	if Debug {
-		log.Printf("Sent NegotiationReply: %#v %#v\n", r.Ver, r.Method)
-	}
+
+	slog.Debug("Sent negotiation reply",
+		slog.Any("version", r.Ver),
+		slog.Any("method", r.Method))
+
 	return int64(i), nil
 }
 
 // NewUserPassNegotiationRequestFrom read user password negotiation request packet from client
-func NewUserPassNegotiationRequestFrom(r io.Reader) (*UserPassNegotiationRequest, error) {
+func NewUserPassNegotiationRequestFrom(r io.Reader) (req *UserPassNegotiationRequest, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewUserPassNegotiationRequestFrom()")
+	}()
+
 	bb := make([]byte, 2)
 	if _, err := io.ReadFull(r, bb); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read version and username length")
 	}
 	if bb[0] != UserPassVer {
 		return nil, ErrUserPassVersion
@@ -76,18 +94,23 @@ func NewUserPassNegotiationRequestFrom(r io.Reader) (*UserPassNegotiationRequest
 	}
 	ub := make([]byte, int(bb[1])+1)
 	if _, err := io.ReadFull(r, ub); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read username and password length")
 	}
 	if ub[int(bb[1])] == 0 {
 		return nil, ErrBadRequest
 	}
 	p := make([]byte, int(ub[int(bb[1])]))
 	if _, err := io.ReadFull(r, p); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read password")
 	}
-	if Debug {
-		log.Printf("Got UserPassNegotiationRequest: %#v %#v %#v %#v %#v\n", bb[0], bb[1], ub[:int(bb[1])], ub[int(bb[1])], p)
-	}
+
+	slog.Debug("Got username/password negotiation request",
+		slog.Any("version", bb[0]),
+		slog.Any("username_length", bb[1]),
+		slog.String("username", string(ub[:int(bb[1])])),
+		slog.Any("password_length", ub[int(bb[1])]),
+		slog.String("password", "[MASKED]"))
+
 	return &UserPassNegotiationRequest{
 		Ver:    bb[0],
 		Ulen:   bb[1],
@@ -106,22 +129,32 @@ func NewUserPassNegotiationReply(status byte) *UserPassNegotiationReply {
 }
 
 // WriteTo write negotiation username password reply packet into client
-func (r *UserPassNegotiationReply) WriteTo(w io.Writer) (int64, error) {
+func (r *UserPassNegotiationReply) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.UserPassNegotiationReply.WriteTo()")
+	}()
+
 	i, err := w.Write([]byte{r.Ver, r.Status})
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "failed to write username/password negotiation reply")
 	}
-	if Debug {
-		log.Printf("Sent UserPassNegotiationReply: %#v %#v \n", r.Ver, r.Status)
-	}
+
+	slog.Debug("Sent username/password negotiation reply",
+		slog.Any("version", r.Ver),
+		slog.Any("status", r.Status))
+
 	return int64(i), nil
 }
 
 // NewRequestFrom read requst packet from client
-func NewRequestFrom(r io.Reader) (*Request, error) {
+func NewRequestFrom(r io.Reader) (req *Request, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewRequestFrom()")
+	}()
+
 	bb := make([]byte, 4)
 	if _, err := io.ReadFull(r, bb); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read request header")
 	}
 	if bb[0] != Ver {
 		return nil, ErrVersion
@@ -130,24 +163,24 @@ func NewRequestFrom(r io.Reader) (*Request, error) {
 	if bb[3] == ATYPIPv4 {
 		addr = make([]byte, 4)
 		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read IPv4 address")
 		}
 	} else if bb[3] == ATYPIPv6 {
 		addr = make([]byte, 16)
 		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read IPv6 address")
 		}
 	} else if bb[3] == ATYPDomain {
 		dal := make([]byte, 1)
 		if _, err := io.ReadFull(r, dal); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read domain length")
 		}
 		if dal[0] == 0 {
 			return nil, ErrBadRequest
 		}
 		addr = make([]byte, int(dal[0]))
 		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read domain")
 		}
 		addr = append(dal, addr...)
 	} else {
@@ -155,19 +188,27 @@ func NewRequestFrom(r io.Reader) (*Request, error) {
 	}
 	port := make([]byte, 2)
 	if _, err := io.ReadFull(r, port); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read port")
 	}
-	if Debug {
-		log.Printf("Got Request: %#v %#v %#v %#v %#v %#v\n", bb[0], bb[1], bb[2], bb[3], addr, port)
-	}
-	return &Request{
+
+	req = &Request{
 		Ver:     bb[0],
 		Cmd:     bb[1],
 		Rsv:     bb[2],
 		Atyp:    bb[3],
 		DstAddr: addr,
 		DstPort: port,
-	}, nil
+	}
+
+	slog.Debug("Got request",
+		slog.Any("version", bb[0]),
+		slog.Any("cmd", bb[1]),
+		slog.Any("rsv", bb[2]),
+		slog.Any("atyp", bb[3]),
+		slog.Any("dst_addr", addr),
+		slog.Any("dst_port", port))
+
+	return req, nil
 }
 
 // NewReply return reply packet can be writed into client, bndaddr should not have domain length
@@ -186,18 +227,32 @@ func NewReply(rep byte, atyp byte, bndaddr []byte, bndport []byte) *Reply {
 }
 
 // WriteTo write reply packet into client
-func (r *Reply) WriteTo(w io.Writer) (int64, error) {
+func (r *Reply) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.Reply.WriteTo()")
+	}()
+
 	i, err := w.Write(append(append([]byte{r.Ver, r.Rep, r.Rsv, r.Atyp}, r.BndAddr...), r.BndPort...))
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "failed to write reply")
 	}
-	if Debug {
-		log.Printf("Sent Reply: %#v %#v %#v %#v %#v %#v\n", r.Ver, r.Rep, r.Rsv, r.Atyp, r.BndAddr, r.BndPort)
-	}
+
+	slog.Debug("Sent reply",
+		slog.Any("version", r.Ver),
+		slog.Any("reply", r.Rep),
+		slog.Any("rsv", r.Rsv),
+		slog.Any("atyp", r.Atyp),
+		slog.Any("bnd_addr", r.BndAddr),
+		slog.Any("bnd_port", r.BndPort))
+
 	return int64(i), nil
 }
 
-func NewDatagramFromBytes(bb []byte) (*Datagram, error) {
+func NewDatagramFromBytes(bb []byte) (dg *Datagram, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewDatagramFromBytes()")
+	}()
+
 	n := len(bb)
 	minl := 4
 	if n < minl {
@@ -248,9 +303,16 @@ func NewDatagramFromBytes(bb []byte) (*Datagram, error) {
 		DstPort: port,
 		Data:    data,
 	}
-	if Debug {
-		log.Printf("Got Datagram. data: %#v %#v %#v %#v %#v %#v datagram address: %#v\n", d.Rsv, d.Frag, d.Atyp, d.DstAddr, d.DstPort, d.Data, d.Address())
-	}
+
+	slog.Debug("Got datagram",
+		slog.Any("rsv", d.Rsv),
+		slog.Any("frag", d.Frag),
+		slog.Any("atyp", d.Atyp),
+		slog.Any("dst_addr", d.DstAddr),
+		slog.Any("dst_port", d.DstPort),
+		slog.Int("data_length", len(d.Data)),
+		slog.String("address", d.Address()))
+
 	return d, nil
 }
 

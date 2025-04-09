@@ -3,19 +3,25 @@ package socks5
 import (
 	"bytes"
 	"encoding/binary"
-	"errors"
 	"net"
 	"strconv"
+
+	"github.com/VanO219/errors"
 )
 
 // ParseAddress format address x.x.x.x:xx to raw address.
 // addr contains domain length
 func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.ParseAddress()")
+	}()
+
 	var h, p string
 	h, p, err = net.SplitHostPort(address)
 	if err != nil {
 		return
 	}
+
 	ip := net.ParseIP(h)
 	if ip4 := ip.To4(); ip4 != nil {
 		a = ATYPIPv4
@@ -28,7 +34,12 @@ func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) 
 		addr = []byte{byte(len(h))}
 		addr = append(addr, []byte(h)...)
 	}
-	i, _ := strconv.Atoi(p)
+
+	i, err := strconv.Atoi(p)
+	if err != nil {
+		return
+	}
+
 	port = make([]byte, 2)
 	binary.BigEndian.PutUint16(port, uint16(i))
 	return
@@ -37,44 +48,52 @@ func ParseAddress(address string) (a byte, addr []byte, port []byte, err error) 
 // bytes to address
 // addr contains domain length
 func ParseBytesAddress(b []byte) (a byte, addr []byte, port []byte, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.ParseBytesAddress()")
+	}()
+
 	if len(b) < 1 {
-		err = errors.New("Invalid address")
+		err = errors.New("Invalid address: too short")
 		return
 	}
+
 	a = b[0]
 	if a == ATYPIPv4 {
 		if len(b) < 1+4+2 {
-			err = errors.New("Invalid address")
+			err = errors.New("Invalid IPv4 address: too short")
 			return
 		}
 		addr = b[1 : 1+4]
 		port = b[1+4 : 1+4+2]
 		return
 	}
+
 	if a == ATYPIPv6 {
 		if len(b) < 1+16+2 {
-			err = errors.New("Invalid address")
+			err = errors.New("Invalid IPv6 address: too short")
 			return
 		}
 		addr = b[1 : 1+16]
 		port = b[1+16 : 1+16+2]
 		return
 	}
+
 	if a == ATYPDomain {
 		if len(b) < 1+1 {
-			err = errors.New("Invalid address")
+			err = errors.New("Invalid domain address: too short")
 			return
 		}
 		l := int(b[1])
 		if len(b) < 1+1+l+2 {
-			err = errors.New("Invalid address")
+			err = errors.New("Invalid domain address: domain name too short")
 			return
 		}
 		addr = b[1 : 1+1+l]
 		port = b[1+1+l : 1+1+l+2]
 		return
 	}
-	err = errors.New("Invalid address")
+
+	err = errors.New("Invalid address type")
 	return
 }
 

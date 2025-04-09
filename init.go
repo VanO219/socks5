@@ -4,10 +4,8 @@ import (
 	"net"
 )
 
-var Debug bool
-
 func init() {
-	// log.SetFlags(log.LstdFlags | log.Lshortfile)
+	// Пользователь библиотеки должен сам настроить логирование через slog.SetDefault()
 }
 
 var Resolve func(network string, addr string) (net.Addr, error) = func(network string, addr string) (net.Addr, error) {

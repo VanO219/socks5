@@ -1,9 +1,10 @@
 package socks5
 
 import (
-	"errors"
 	"io"
-	"log"
+	"log/slog"
+
+	"github.com/VanO219/errors"
 )
 
 var (
@@ -21,29 +22,42 @@ func NewNegotiationRequest(methods []byte) *NegotiationRequest {
 }
 
 // WriteTo write negotiation request packet into server
-func (r *NegotiationRequest) WriteTo(w io.Writer) (int64, error) {
+func (r *NegotiationRequest) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NegotiationRequest.WriteTo()")
+	}()
+
 	i, err := w.Write(append([]byte{r.Ver, r.NMethods}, r.Methods...))
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "failed to write negotiation request")
 	}
-	if Debug {
-		log.Printf("Sent NegotiationRequest: %#v %#v %#v\n", r.Ver, r.NMethods, r.Methods)
-	}
+
+	slog.Debug("Sent negotiation request",
+		slog.Any("version", r.Ver),
+		slog.Any("methods_count", r.NMethods),
+		slog.Any("methods", r.Methods))
+
 	return int64(i), nil
 }
 
 // NewNegotiationReplyFrom read negotiation reply packet from server
-func NewNegotiationReplyFrom(r io.Reader) (*NegotiationReply, error) {
+func NewNegotiationReplyFrom(r io.Reader) (reply *NegotiationReply, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewNegotiationReplyFrom()")
+	}()
+
 	bb := make([]byte, 2)
 	if _, err := io.ReadFull(r, bb); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read negotiation reply")
 	}
 	if bb[0] != Ver {
 		return nil, ErrVersion
 	}
-	if Debug {
-		log.Printf("Got NegotiationReply: %#v %#v\n", bb[0], bb[1])
-	}
+
+	slog.Debug("Got negotiation reply",
+		slog.Any("version", bb[0]),
+		slog.Any("method", bb[1]))
+
 	return &NegotiationReply{
 		Ver:    bb[0],
 		Method: bb[1],
@@ -62,29 +76,44 @@ func NewUserPassNegotiationRequest(username []byte, password []byte) *UserPassNe
 }
 
 // WriteTo write user password negotiation request packet into server
-func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (int64, error) {
+func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.UserPassNegotiationRequest.WriteTo()")
+	}()
+
 	i, err := w.Write(append(append(append([]byte{r.Ver, r.Ulen}, r.Uname...), r.Plen), r.Passwd...))
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "failed to write username/password negotiation request")
 	}
-	if Debug {
-		log.Printf("Sent UserNameNegotiationRequest: %#v %#v %#v %#v %#v\n", r.Ver, r.Ulen, r.Uname, r.Plen, r.Passwd)
-	}
+
+	slog.Debug("Sent username/password negotiation request",
+		slog.Any("version", r.Ver),
+		slog.Any("username_length", r.Ulen),
+		slog.String("username", string(r.Uname)),
+		slog.Any("password_length", r.Plen),
+		slog.String("password", "[MASKED]"))
+
 	return int64(i), nil
 }
 
 // NewUserPassNegotiationReplyFrom read user password negotiation reply packet from server
-func NewUserPassNegotiationReplyFrom(r io.Reader) (*UserPassNegotiationReply, error) {
+func NewUserPassNegotiationReplyFrom(r io.Reader) (reply *UserPassNegotiationReply, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewUserPassNegotiationReplyFrom()")
+	}()
+
 	bb := make([]byte, 2)
 	if _, err := io.ReadFull(r, bb); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read username/password negotiation reply")
 	}
 	if bb[0] != UserPassVer {
 		return nil, ErrUserPassVersion
 	}
-	if Debug {
-		log.Printf("Got UserPassNegotiationReply: %#v %#v \n", bb[0], bb[1])
-	}
+
+	slog.Debug("Got username/password negotiation reply",
+		slog.Any("version", bb[0]),
+		slog.Any("status", bb[1]))
+
 	return &UserPassNegotiationReply{
 		Ver:    bb[0],
 		Status: bb[1],
@@ -107,66 +136,90 @@ func NewRequest(cmd byte, atyp byte, dstaddr []byte, dstport []byte) *Request {
 }
 
 // WriteTo write request packet into server
-func (r *Request) WriteTo(w io.Writer) (int64, error) {
+func (r *Request) WriteTo(w io.Writer) (n int64, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.Request.WriteTo()")
+	}()
+
 	i, err := w.Write(append(append([]byte{r.Ver, r.Cmd, r.Rsv, r.Atyp}, r.DstAddr...), r.DstPort...))
 	if err != nil {
-		return 0, err
+		return 0, errors.Wrap(err, "failed to write request")
 	}
-	if Debug {
-		log.Printf("Sent Request: %#v %#v %#v %#v %#v %#v\n", r.Ver, r.Cmd, r.Rsv, r.Atyp, r.DstAddr, r.DstPort)
-	}
+
+	slog.Debug("Sent request",
+		slog.Any("version", r.Ver),
+		slog.Any("cmd", r.Cmd),
+		slog.Any("rsv", r.Rsv),
+		slog.Any("atyp", r.Atyp),
+		slog.Any("dst_addr", r.DstAddr),
+		slog.Any("dst_port", r.DstPort))
+
 	return int64(i), nil
 }
 
 // NewReplyFrom read reply packet from server
-func NewReplyFrom(r io.Reader) (*Reply, error) {
+func NewReplyFrom(r io.Reader) (reply *Reply, err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.NewReplyFrom()")
+	}()
+
 	bb := make([]byte, 4)
 	if _, err := io.ReadFull(r, bb); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read reply header")
 	}
 	if bb[0] != Ver {
 		return nil, ErrVersion
 	}
+
 	var addr []byte
 	if bb[3] == ATYPIPv4 {
 		addr = make([]byte, 4)
 		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read IPv4 address")
 		}
 	} else if bb[3] == ATYPIPv6 {
 		addr = make([]byte, 16)
 		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read IPv6 address")
 		}
 	} else if bb[3] == ATYPDomain {
 		dal := make([]byte, 1)
 		if _, err := io.ReadFull(r, dal); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read domain length")
 		}
 		if dal[0] == 0 {
 			return nil, ErrBadReply
 		}
 		addr = make([]byte, int(dal[0]))
 		if _, err := io.ReadFull(r, addr); err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "failed to read domain address")
 		}
 		addr = append(dal, addr...)
 	} else {
 		return nil, ErrBadReply
 	}
+
 	port := make([]byte, 2)
 	if _, err := io.ReadFull(r, port); err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "failed to read port")
 	}
-	if Debug {
-		log.Printf("Got Reply: %#v %#v %#v %#v %#v %#v\n", bb[0], bb[1], bb[2], bb[3], addr, port)
-	}
-	return &Reply{
+
+	reply = &Reply{
 		Ver:     bb[0],
 		Rep:     bb[1],
 		Rsv:     bb[2],
 		Atyp:    bb[3],
 		BndAddr: addr,
 		BndPort: port,
-	}, nil
+	}
+
+	slog.Debug("Got reply",
+		slog.Any("version", bb[0]),
+		slog.Any("reply", bb[1]),
+		slog.Any("rsv", bb[2]),
+		slog.Any("atyp", bb[3]),
+		slog.Any("bnd_addr", addr),
+		slog.Any("bnd_port", port))
+
+	return reply, nil
 }
