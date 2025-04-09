@@ -2,7 +2,7 @@ package socks5_test
 
 import (
 	"encoding/hex"
-	"io/ioutil"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -42,7 +42,7 @@ func ExampleClient_tcp() {
 		return
 	}
 	defer res.Body.Close()
-	b, err := ioutil.ReadAll(res.Body)
+	b, err := io.ReadAll(res.Body)
 	if err != nil {
 		log.Println(err)
 		return

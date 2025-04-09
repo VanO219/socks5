@@ -1,6 +1,7 @@
 package socks5
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -180,11 +181,32 @@ func (s *Server) ListenAndServe(h Handler) (err error) {
 		err = errors.Wrap(err, "socks5.Server.ListenAndServe()")
 	}()
 
+	// Создаем фоновый контекст для запуска сервера
+	return s.ListenAndServeWithContext(context.Background(), h)
+}
+
+// ListenAndServeWithContext runs server with context control
+func (s *Server) ListenAndServeWithContext(ctx context.Context, h Handler) (err error) {
+	defer func() {
+		err = errors.Wrap(err, "socks5.Server.ListenAndServeWithContext()")
+	}()
+
 	if h == nil {
 		s.Handle = &DefaultHandle{}
 	} else {
 		s.Handle = h
 	}
+
+	// Создаем контекст с отменой, привязанный к переданному контексту
+	serverCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	// Горутина для мониторинга контекста
+	go func() {
+		<-ctx.Done()
+		slog.Info("Server context canceled, initiating shutdown")
+		s.Shutdown()
+	}()
 
 	addr, err := net.ResolveTCPAddr("tcp", s.Addr)
 	if err != nil {
@@ -199,28 +221,46 @@ func (s *Server) ListenAndServe(h Handler) (err error) {
 	s.RunnerGroup.Add(&runnergroup.Runner{
 		Start: func() error {
 			for {
-				c, err := l.AcceptTCP()
-				if err != nil {
-					return err
-				}
-				go func(c *net.TCPConn) {
-					defer c.Close()
-					if err := s.Negotiate(c); err != nil {
-						slog.Error("Failed to negotiate", slog.Any("error", err))
-						return
-					}
-					r, err := s.GetRequest(c)
+				// Проверяем отмену контекста
+				select {
+				case <-serverCtx.Done():
+					return serverCtx.Err()
+				default:
+					// Устанавливаем таймаут на принятие соединения для периодической проверки контекста
+					l.SetDeadline(time.Now().Add(time.Second * 3))
+					c, err := l.AcceptTCP()
 					if err != nil {
-						slog.Error("Failed to get request", slog.Any("error", err))
-						return
+						// Ошибка таймаута, проверяем контекст и продолжаем
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							continue
+						}
+						return err
 					}
-					if err := s.Handle.TCPHandle(s, c, r); err != nil {
-						slog.Error("Failed to handle TCP", slog.Any("error", err))
-					}
-				}(c)
+					// Для каждого соединения создаем свой контекст
+					connCtx, connCancel := context.WithCancel(serverCtx)
+					go func(ctx context.Context, cancel context.CancelFunc, c *net.TCPConn) {
+						defer func() {
+							c.Close()
+							cancel()
+						}()
+						if err := s.Negotiate(c); err != nil {
+							slog.Error("Failed to negotiate", slog.Any("error", err))
+							return
+						}
+						r, err := s.GetRequest(c)
+						if err != nil {
+							slog.Error("Failed to get request", slog.Any("error", err))
+							return
+						}
+						if err := s.Handle.TCPHandle(ctx, s, c, r); err != nil {
+							slog.Error("Failed to handle TCP", slog.Any("error", err))
+						}
+					}(connCtx, connCancel, c)
+				}
 			}
 		},
 		Stop: func() error {
+			cancel() // Отменяем серверный контекст при остановке
 			return l.Close()
 		},
 	})
@@ -240,29 +280,45 @@ func (s *Server) ListenAndServe(h Handler) (err error) {
 	s.RunnerGroup.Add(&runnergroup.Runner{
 		Start: func() error {
 			for {
-				b := make([]byte, 65507)
-				n, addr, err := s.UDPConn.ReadFromUDP(b)
-				if err != nil {
-					return err
-				}
-				go func(addr *net.UDPAddr, b []byte) {
-					d, err := NewDatagramFromBytes(b)
+				// Проверяем отмену контекста
+				select {
+				case <-serverCtx.Done():
+					return serverCtx.Err()
+				default:
+					// Устанавливаем таймаут для чтения UDP, чтобы периодически проверять контекст
+					s.UDPConn.SetReadDeadline(time.Now().Add(time.Second * 3))
+					b := make([]byte, 65507)
+					n, addr, err := s.UDPConn.ReadFromUDP(b)
 					if err != nil {
-						slog.Error("Failed to parse datagram", slog.Any("error", err))
-						return
+						// Ошибка таймаута, проверяем контекст и продолжаем
+						if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+							continue
+						}
+						return err
 					}
-					if d.Frag != 0x00 {
-						slog.Info("Ignoring fragmented datagram", slog.Any("frag", d.Frag))
-						return
-					}
-					if err := s.Handle.UDPHandle(s, addr, d); err != nil {
-						slog.Error("Failed to handle UDP", slog.Any("error", err))
-						return
-					}
-				}(addr, b[0:n])
+					// Создаем контекст для обработки датаграммы
+					dgCtx, dgCancel := context.WithCancel(serverCtx)
+					go func(ctx context.Context, cancel context.CancelFunc, addr *net.UDPAddr, b []byte) {
+						defer cancel()
+						d, err := NewDatagramFromBytes(b)
+						if err != nil {
+							slog.Error("Failed to parse datagram", slog.Any("error", err))
+							return
+						}
+						if d.Frag != 0x00 {
+							slog.Info("Ignoring fragmented datagram", slog.Any("frag", d.Frag))
+							return
+						}
+						if err := s.Handle.UDPHandle(ctx, s, addr, d); err != nil {
+							slog.Error("Failed to handle UDP", slog.Any("error", err))
+							return
+						}
+					}(dgCtx, dgCancel, addr, b[0:n])
+				}
 			}
 		},
 		Stop: func() error {
+			cancel() // Отменяем серверный контекст при остановке
 			return s.UDPConn.Close()
 		},
 	})
@@ -278,8 +334,8 @@ func (s *Server) Shutdown() error {
 // Handler handle tcp, udp request
 type Handler interface {
 	// Request has not been replied yet
-	TCPHandle(*Server, *net.TCPConn, *Request) error
-	UDPHandle(*Server, *net.UDPAddr, *Datagram) error
+	TCPHandle(context.Context, *Server, *net.TCPConn, *Request) error
+	UDPHandle(context.Context, *Server, *net.UDPAddr, *Datagram) error
 }
 
 // DefaultHandle implements Handler interface
@@ -287,7 +343,7 @@ type DefaultHandle struct {
 }
 
 // TCPHandle auto handle request. You may prefer to do yourself.
-func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err error) {
+func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn, r *Request) (err error) {
 	defer func() {
 		err = errors.Wrap(err, "socks5.DefaultHandle.TCPHandle()")
 	}()
@@ -299,37 +355,66 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err er
 		}
 		defer rc.Close()
 
+		// Создаем контекст с возможностью отмены
+		connCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// Канал для сигнализации о завершении горутины
+		doneCh := make(chan struct{})
+
+		// Горутина для чтения из удаленного соединения и записи в клиентское
 		go func() {
+			defer func() {
+				close(doneCh)
+				cancel() // Отменяем контекст при завершении горутины
+			}()
+
 			var bf [1024 * 2]byte
 			for {
-				if s.TCPTimeout != 0 {
-					if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
+				select {
+				case <-connCtx.Done():
+					return
+				default:
+					if s.TCPTimeout != 0 {
+						if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
+							slog.Error("Failed to set deadline", slog.Any("error", err))
+							return
+						}
+					}
+					i, err := rc.Read(bf[:])
+					if err != nil {
 						return
 					}
-				}
-				i, err := rc.Read(bf[:])
-				if err != nil {
-					return
-				}
-				if _, err := c.Write(bf[0:i]); err != nil {
-					return
+					if _, err := c.Write(bf[0:i]); err != nil {
+						return
+					}
 				}
 			}
 		}()
 
+		// Чтение из клиентского соединения и запись в удаленное
 		var bf [1024 * 2]byte
 		for {
-			if s.TCPTimeout != 0 {
-				if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
+			select {
+			case <-ctx.Done():
+				// Контекст был отменен, завершаем работу
+				return ctx.Err()
+			case <-doneCh:
+				// Горутина чтения завершилась
+				return nil
+			default:
+				if s.TCPTimeout != 0 {
+					if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
+						return errors.Wrap(err, "failed to set client deadline")
+					}
+				}
+				i, err := c.Read(bf[:])
+				if err != nil {
 					return nil
 				}
-			}
-			i, err := c.Read(bf[:])
-			if err != nil {
-				return nil
-			}
-			if _, err := rc.Write(bf[0:i]); err != nil {
-				return nil
+				if _, err := rc.Write(bf[0:i]); err != nil {
+					return nil
+				}
 			}
 		}
 	}
@@ -345,6 +430,20 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err er
 		s.AssociatedUDP.Set(caddr.String(), ch, -1)
 		defer s.AssociatedUDP.Delete(caddr.String())
 
+		// Создаем контекст с отменой
+		udpCtx, cancel := context.WithCancel(ctx)
+		defer cancel()
+
+		// Отдельная горутина для мониторинга контекста и закрытия соединения
+		go func() {
+			select {
+			case <-udpCtx.Done():
+				c.Close()
+			case <-ch:
+				// Канал закрылся, ничего не делаем
+			}
+		}()
+
 		io.Copy(io.Discard, c)
 		slog.Debug("TCP connection associated with UDP closed", slog.String("client_addr", caddr.String()))
 
@@ -354,7 +453,7 @@ func (h *DefaultHandle) TCPHandle(s *Server, c *net.TCPConn, r *Request) (err er
 }
 
 // UDPHandle auto handle packet. You may prefer to do yourself.
-func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) (err error) {
+func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPAddr, d *Datagram) (err error) {
 	defer func() {
 		err = errors.Wrap(err, "socks5.DefaultHandle.UDPHandle()")
 	}()
@@ -371,6 +470,8 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) (er
 
 	send := func(ue *UDPExchange, data []byte) error {
 		select {
+		case <-ctx.Done():
+			return ctx.Err()
 		case <-ch:
 			return fmt.Errorf("This udp address %s is not associated with tcp", src)
 		default:
@@ -445,6 +546,9 @@ func (h *DefaultHandle) UDPHandle(s *Server, addr *net.UDPAddr, d *Datagram) (er
 		var b [65507]byte
 		for {
 			select {
+			case <-ctx.Done():
+				slog.Debug("Context canceled", slog.String("client", ue.ClientAddr.String()))
+				return
 			case <-ch:
 				slog.Debug("TCP connection closed", slog.String("client", ue.ClientAddr.String()))
 				return
