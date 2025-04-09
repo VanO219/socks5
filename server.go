@@ -472,13 +472,7 @@ func (s *Server) GetRequest(rw io.ReadWriter) (r *Request, err error) {
 		}
 	}
 	if !supported {
-		var p *Reply
-		if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
-			p = NewReply(RepCommandNotSupported, ATYPIPv4, []byte{0x00, 0x00, 0x00, 0x00}, []byte{0x00, 0x00})
-		} else {
-			p = NewReply(RepCommandNotSupported, ATYPIPv6, []byte(net.IPv6zero), []byte{0x00, 0x00})
-		}
-		if _, err := p.WriteTo(rw); err != nil {
+		if err := r.ReplyWithError(rw, RepCommandNotSupported); err != nil {
 			return nil, errors.Wrap(err, "failed to write reply")
 		}
 		return nil, ErrUnsupportCmd
@@ -736,85 +730,76 @@ func (h *DefaultHandle) TCPHandle(ctx context.Context, s *Server, c *net.TCPConn
 		connCtx, cancel := context.WithCancel(ctx)
 		defer cancel()
 
-		// Канал для сигнализации о завершении горутины
-		doneCh := make(chan struct{})
+		// Настраиваем таймаут, если необходимо
+		if s.TCPTimeout != 0 {
+			go func() {
+				ticker := time.NewTicker(time.Duration(s.TCPTimeout/2) * time.Second)
+				defer ticker.Stop()
+				for {
+					select {
+					case <-ticker.C:
+						c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
+						rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second))
+					case <-connCtx.Done():
+						return
+					}
+				}
+			}()
+		}
 
-		// Горутина для чтения из удаленного соединения и записи в клиентское
+		// Используем пользовательский буфер из пула для io.CopyBuffer
+		buf := s.MediumBufferPool.Get()
+		defer s.MediumBufferPool.Put(buf)
+
+		// Канал для сигнализации о завершении одной из горутин
+		doneCh := make(chan struct{}, 2)
+
+		// Используем io.Copy для копирования данных между соединениями
 		go func() {
 			defer func() {
-				close(doneCh)
+				doneCh <- struct{}{}
 				cancel() // Отменяем контекст при завершении горутины
 			}()
 
-			// Берем буфер из пула вместо локальной аллокации
-			buf := s.MediumBufferPool.Get() // Используем буфер большего размера
-			defer s.MediumBufferPool.Put(buf)
-
-			for {
-				select {
-				case <-connCtx.Done():
-					return
-				default:
-					if s.TCPTimeout != 0 {
-						if err := rc.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
-							slog.Error("Failed to set deadline", slog.Any("error", err))
-							return
-						}
-					}
-
-					// Чтение из буферизованного reader
-					i, err := remoteReader.Read(buf)
-					if err != nil {
-						return
-					}
-
-					// Запись в буферизованный writer
-					if _, err := clientWriter.Write(buf[0:i]); err != nil {
-						return
-					}
-
-					// Немедленная отправка данных
-					if err := clientWriter.Flush(); err != nil {
-						return
-					}
-				}
+			// Копируем данные от удаленного соединения к клиенту
+			_, err := io.CopyBuffer(clientWriter, remoteReader, buf)
+			if err != nil {
+				slog.Debug("Error copying from remote to client", slog.Any("error", err))
 			}
+			// Сбрасываем буфер, чтобы отправить все данные
+			clientWriter.Flush()
 		}()
 
-		// Чтение из клиентского соединения и запись в удаленное
-		buf := s.MediumBufferPool.Get() // Используем буфер большего размера
-		defer s.MediumBufferPool.Put(buf)
+		go func() {
+			defer func() {
+				doneCh <- struct{}{}
+				cancel() // Отменяем контекст при завершении горутины
+			}()
 
-		for {
+			// Копируем данные от клиента к удаленному соединению
+			_, err := io.CopyBuffer(remoteWriter, clientReader, buf)
+			if err != nil {
+				slog.Debug("Error copying from client to remote", slog.Any("error", err))
+			}
+			// Сбрасываем буфер, чтобы отправить все данные
+			remoteWriter.Flush()
+		}()
+
+		// Ожидаем завершения любой из горутин или отмены контекста
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-doneCh:
+			// Ждем другую горутину или таймаут
 			select {
 			case <-ctx.Done():
-				// Контекст был отменен, завершаем работу
 				return ctx.Err()
 			case <-doneCh:
-				// Горутина чтения завершилась
+				// Обе горутины завершились
 				return nil
-			default:
-				if s.TCPTimeout != 0 {
-					if err := c.SetDeadline(time.Now().Add(time.Duration(s.TCPTimeout) * time.Second)); err != nil {
-						return errors.Wrap(err, "failed to set client deadline")
-					}
-				}
-
-				// Чтение из буферизованного reader
-				i, err := clientReader.Read(buf)
-				if err != nil {
-					return nil
-				}
-
-				// Запись в буферизованный writer
-				if _, err := remoteWriter.Write(buf[0:i]); err != nil {
-					return nil
-				}
-
-				// Немедленная отправка данных
-				if err := remoteWriter.Flush(); err != nil {
-					return nil
-				}
+			case <-time.After(time.Second * 5):
+				// Таймаут ожидания другой горутины
+				return nil
 			}
 		}
 	}
@@ -990,6 +975,15 @@ func (h *DefaultHandle) UDPHandle(ctx context.Context, s *Server, addr *net.UDPA
 							slog.Any("error", err))
 					}
 					return
+				}
+
+				// Проверяем, не был ли пакет отсечен (максимальный размер UDP-датаграммы)
+				if n == len(buf) {
+					slog.Warn("Possible UDP datagram truncation detected",
+						slog.String("client", ue.ClientAddr.String()),
+						slog.String("remote", ue.RemoteConn.RemoteAddr().String()),
+						slog.Int("buffer_size", len(buf)),
+						slog.Int("read_bytes", n))
 				}
 
 				slog.Debug("Got UDP data from remote",

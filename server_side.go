@@ -3,6 +3,8 @@ package socks5
 import (
 	"io"
 	"log/slog"
+	"net"
+	"runtime"
 
 	"github.com/VanO219/errors"
 )
@@ -64,7 +66,7 @@ func (r *NegotiationReply) WriteTo(w io.Writer) (n int64, err error) {
 		err = errors.Wrap(err, "socks5.NegotiationReply.WriteTo()")
 	}()
 
-	i, err := w.Write([]byte{r.Ver, r.Method})
+	i, err := WriteAll(w, []byte{r.Ver, r.Method})
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write negotiation reply")
 	}
@@ -111,13 +113,24 @@ func NewUserPassNegotiationRequestFrom(r io.Reader) (req *UserPassNegotiationReq
 		slog.Any("password_length", ub[int(bb[1])]),
 		slog.String("password", "[MASKED]"))
 
-	return &UserPassNegotiationRequest{
+	req = &UserPassNegotiationRequest{
 		Ver:    bb[0],
 		Ulen:   bb[1],
 		Uname:  ub[:int(bb[1])],
 		Plen:   ub[int(bb[1])],
 		Passwd: p,
-	}, nil
+	}
+
+	// Планируем очистку пароля после возврата из этой функции
+	// Это не даёт 100% гарантии, но снижает вероятность хранения пароля в памяти
+	runtime.SetFinalizer(req, func(r *UserPassNegotiationRequest) {
+		for i := range r.Passwd {
+			r.Passwd[i] = 0
+		}
+		slog.Debug("Password cleared from memory")
+	})
+
+	return req, nil
 }
 
 // NewUserPassNegotiationReply return negotiation username password reply packet can be writed into client
@@ -134,7 +147,7 @@ func (r *UserPassNegotiationReply) WriteTo(w io.Writer) (n int64, err error) {
 		err = errors.Wrap(err, "socks5.UserPassNegotiationReply.WriteTo()")
 	}()
 
-	i, err := w.Write([]byte{r.Ver, r.Status})
+	i, err := WriteAll(w, []byte{r.Ver, r.Status})
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write username/password negotiation reply")
 	}
@@ -232,7 +245,7 @@ func (r *Reply) WriteTo(w io.Writer) (n int64, err error) {
 		err = errors.Wrap(err, "socks5.Reply.WriteTo()")
 	}()
 
-	i, err := w.Write(append(append([]byte{r.Ver, r.Rep, r.Rsv, r.Atyp}, r.BndAddr...), r.BndPort...))
+	i, err := WriteAll(w, append(append([]byte{r.Ver, r.Rep, r.Rsv, r.Atyp}, r.BndAddr...), r.BndPort...))
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write reply")
 	}
@@ -369,4 +382,17 @@ func (d *Datagram) Bytes() []byte {
 	copy(b[offset:], d.Data)
 
 	return b
+}
+
+// ReplyWithError отправляет ответ с ошибкой клиенту, автоматически выбирая
+// правильный тип адреса (IPv4 или IPv6) на основе исходного запроса
+func (r *Request) ReplyWithError(w io.Writer, rep byte) error {
+	var reply *Reply
+	if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
+		reply = NewReply(rep, ATYPIPv4, []byte{0, 0, 0, 0}, []byte{0, 0})
+	} else {
+		reply = NewReply(rep, ATYPIPv6, []byte(net.IPv6zero), []byte{0, 0})
+	}
+	_, err := reply.WriteTo(w)
+	return err
 }

@@ -3,6 +3,7 @@ package socks5
 import (
 	"bytes"
 	"encoding/binary"
+	"io"
 	"net"
 	"strconv"
 
@@ -151,4 +152,22 @@ func (d *Datagram) Address() string {
 	}
 	p := strconv.Itoa(int(binary.BigEndian.Uint16(d.DstPort)))
 	return net.JoinHostPort(s, p)
+}
+
+// WriteAll записывает все данные в writer, обрабатывая частичные записи
+// Эта функция гарантирует, что все данные будут записаны полностью или
+// вернется ошибка, если операция не может быть завершена
+func WriteAll(w io.Writer, data []byte) (int, error) {
+	total := 0
+	for total < len(data) {
+		n, err := w.Write(data[total:])
+		total += n
+		if err != nil {
+			return total, err
+		}
+		if n == 0 { // Избегаем бесконечного цикла при нулевой записи
+			return total, errors.New("write returned 0 bytes written without error")
+		}
+	}
+	return total, nil
 }

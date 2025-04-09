@@ -27,7 +27,7 @@ func (r *NegotiationRequest) WriteTo(w io.Writer) (n int64, err error) {
 		err = errors.Wrap(err, "socks5.NegotiationRequest.WriteTo()")
 	}()
 
-	i, err := w.Write(append([]byte{r.Ver, r.NMethods}, r.Methods...))
+	i, err := WriteAll(w, append([]byte{r.Ver, r.NMethods}, r.Methods...))
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write negotiation request")
 	}
@@ -81,7 +81,7 @@ func (r *UserPassNegotiationRequest) WriteTo(w io.Writer) (n int64, err error) {
 		err = errors.Wrap(err, "socks5.UserPassNegotiationRequest.WriteTo()")
 	}()
 
-	i, err := w.Write(append(append(append([]byte{r.Ver, r.Ulen}, r.Uname...), r.Plen), r.Passwd...))
+	i, err := WriteAll(w, append(append(append([]byte{r.Ver, r.Ulen}, r.Uname...), r.Plen), r.Passwd...))
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write username/password negotiation request")
 	}
@@ -141,7 +141,7 @@ func (r *Request) WriteTo(w io.Writer) (n int64, err error) {
 		err = errors.Wrap(err, "socks5.Request.WriteTo()")
 	}()
 
-	i, err := w.Write(append(append([]byte{r.Ver, r.Cmd, r.Rsv, r.Atyp}, r.DstAddr...), r.DstPort...))
+	i, err := WriteAll(w, append(append([]byte{r.Ver, r.Cmd, r.Rsv, r.Atyp}, r.DstAddr...), r.DstPort...))
 	if err != nil {
 		return 0, errors.Wrap(err, "failed to write request")
 	}
