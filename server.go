@@ -45,8 +45,12 @@ func (p *BufferPool) Get() []byte {
 	return p.pool.Get().([]byte)
 }
 
-// Put возвращает буфер в пул
+// Put возвращает буфер в пул после обнуления его содержимого
 func (p *BufferPool) Put(b []byte) {
+	// Обнуляем буфер для предотвращения повторного использования старых данных
+	for i := range b {
+		b[i] = 0
+	}
 	p.pool.Put(b)
 }
 
@@ -141,7 +145,7 @@ func (p *UDPConnectionPool) Get(srcAddr, dstAddr string) (*net.UDPConn, error) {
 	}
 
 	// Нет доступных соединений, создаем новое
-	netConn, err := DialUDP("udp", srcAddr, dstAddr)
+	netConn, err := DialUDP(srcAddr, dstAddr)
 	if err != nil {
 		return nil, err
 	}

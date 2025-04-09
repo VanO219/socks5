@@ -2,6 +2,8 @@ package socks5
 
 import (
 	"net"
+
+	"github.com/VanO219/errors"
 )
 
 var Resolve func(network string, addr string) (net.Addr, error) = func(network string, addr string) (net.Addr, error) {
@@ -11,36 +13,38 @@ var Resolve func(network string, addr string) (net.Addr, error) = func(network s
 	return net.ResolveUDPAddr("udp", addr)
 }
 
-var DialTCP func(network string, laddr, raddr string) (net.Conn, error) = func(network string, laddr, raddr string) (net.Conn, error) {
-	var la, ra *net.TCPAddr
+var DialTCP func(laddr, raddr string) (net.Conn, error) = func(laddr, raddr string) (net.Conn, error) {
+	var la *net.TCPAddr
 	if laddr != "" {
 		var err error
-		la, err = net.ResolveTCPAddr(network, laddr)
+		la, err = net.ResolveTCPAddr("tcp", laddr)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "init.DialTCP: resolve local address failed")
 		}
 	}
-	a, err := Resolve(network, raddr)
+
+	ra, err := net.ResolveTCPAddr("tcp", raddr)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "init.DialTCP: resolve remote address failed")
 	}
-	ra = a.(*net.TCPAddr)
-	return net.DialTCP(network, la, ra)
+
+	return net.DialTCP("tcp", la, ra)
 }
 
-var DialUDP func(network string, laddr, raddr string) (net.Conn, error) = func(network string, laddr, raddr string) (net.Conn, error) {
-	var la, ra *net.UDPAddr
+var DialUDP func(laddr, raddr string) (net.Conn, error) = func(laddr, raddr string) (net.Conn, error) {
+	var la *net.UDPAddr
 	if laddr != "" {
 		var err error
-		la, err = net.ResolveUDPAddr(network, laddr)
+		la, err = net.ResolveUDPAddr("udp", laddr)
 		if err != nil {
-			return nil, err
+			return nil, errors.Wrap(err, "init.DialUDP: resolve local address failed")
 		}
 	}
-	a, err := Resolve(network, raddr)
+
+	ra, err := net.ResolveUDPAddr("udp", raddr)
 	if err != nil {
-		return nil, err
+		return nil, errors.Wrap(err, "init.DialUDP: resolve remote address failed")
 	}
-	ra = a.(*net.UDPAddr)
-	return net.DialUDP(network, la, ra)
+
+	return net.DialUDP("udp", la, ra)
 }

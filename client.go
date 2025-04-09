@@ -112,7 +112,7 @@ func (c *Client) DialWithLocalAddr(network, src, dst string, remoteAddr net.Addr
 			return nil, errors.Wrap(err, "failed to send UDP request")
 		}
 
-		c.UDPConn, err = DialUDP("udp", src, rp.Address())
+		c.UDPConn, err = DialUDP(src, rp.Address())
 		if err != nil {
 			return nil, errors.Wrap(err, "failed to dial UDP")
 		}
@@ -277,7 +277,7 @@ func (c *Client) Negotiate(laddr net.Addr) (err error) {
 		src = laddr.String()
 	}
 
-	c.TCPConn, err = DialTCP("tcp", src, c.Server)
+	c.TCPConn, err = DialTCP(src, c.Server)
 	if err != nil {
 		return errors.Wrap(err, "failed to dial TCP")
 	}

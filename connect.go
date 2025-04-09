@@ -17,7 +17,7 @@ func (r *Request) Connect(w io.Writer) (rc net.Conn, err error) {
 
 	slog.Debug("Connecting to address", slog.String("address", r.Address()))
 
-	rc, err = DialTCP("tcp", "", r.Address())
+	rc, err = DialTCP("", r.Address())
 	if err != nil {
 		var p *Reply
 		if r.Atyp == ATYPIPv4 || r.Atyp == ATYPDomain {
